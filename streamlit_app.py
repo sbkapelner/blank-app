@@ -1,14 +1,134 @@
 import streamlit as st
 import requests
-import re
 from bs4 import BeautifulSoup
-import pandas as pd
+import re
 
-# ------------------------------
-# Patent Fetching Logic
-# ------------------------------
+# -------------------------------
+# Patent scraping logic
+# -------------------------------
 
-FIELDS = [
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 11_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.1.2 Safari/605.1.15",
+    "Accept-Encoding": "gzip, deflate",
+    "Accept": "*/*",
+    "Connection": "keep-alive",
+}
+
+def fetch_html(pat_no):
+    url = f"https://patents.google.com/patent/{pat_no}/en?oq={pat_no}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20)
+        return r, r.status_code, url
+    except Exception as e:
+        return None, 0, url
+
+def parse_expiration(soup):
+    """
+    Return the expiration date by trying multiple known paths used by Google Patents.
+    """
+
+    # 1. Normal utility patent expiration: <time itemprop="expiration">
+    t = soup.find("time", itemprop="expiration")
+    if t and t.get("datetime"):
+        return t["datetime"]
+
+    # 2. Adjusted expiration (often used for utility patents)
+    events = soup.find_all("dd", itemprop="events")
+    for ev in events:
+        time_tag = ev.find("time")
+        title_tag = ev.find("span", itemprop="title")
+        if time_tag and time_tag.get("datetime"):
+            title_text = title_tag.get_text(strip=True).lower() if title_tag else ""
+            if "adjusted expiration" in title_text:
+                return time_tag["datetime"]
+
+    # 3. Anticipated expiration (design patents)
+    for ev in events:
+        time_tag = ev.find("time")
+        title_tag = ev.find("span", itemprop="title")
+        if time_tag and time_tag.get("datetime"):
+            title_text = title_tag.get_text(strip=True).lower() if title_tag else ""
+            if "anticipated expiration" in title_text:
+                return time_tag["datetime"]
+
+    # 4. Fallback: first datetime-looking value under "events"
+    for ev in events:
+        t = ev.find("time")
+        if t and t.get("datetime"):
+            return t["datetime"]
+
+    return "DATE MISSING"
+
+def parse_priority_date(soup):
+    """
+    Try all known priority date markers.
+    """
+
+    # 1. Normal Google Patents priority date
+    t = soup.find(attrs={"itemprop": "priorityDate"})
+    if t and t.text.strip():
+        return t.text.strip()
+
+    # 2. Alternative: prior art date
+    t = soup.find("time", itemprop="priorArtDate")
+    if t and t.get("datetime"):
+        return t["datetime"]
+
+    return "DATE MISSING"
+
+
+def parse_patent(pat_no, html_response):
+    soup = BeautifulSoup(html_response.text, "html.parser")
+
+    # Title + patent number
+    patent_no_clean = ""
+    title = ""
+    tag = soup.find("title")
+    if tag and tag.text:
+        parts = re.split(r" - |\n", tag.text)
+        if len(parts) >= 2:
+            patent_no_clean = parts[0].strip()
+            title = parts[1].strip()
+
+    # Inventor
+    inventor_tag = soup.find("dd", itemprop="inventor")
+    inventor = inventor_tag.get_text(strip=True) if inventor_tag else "None"
+
+    # Assignee
+    assignee_tag = soup.find("span", itemprop="assigneeSearch")
+    assignee = assignee_tag.get_text(strip=True) if assignee_tag else "None"
+
+    # Status
+    status_tag = soup.find("span", itemprop="status")
+    status_val = status_tag.get_text(strip=True) if status_tag else "Unknown"
+
+    # Expiration date (new robust method)
+    exp_date = parse_expiration(soup)
+
+    # Priority date (robust)
+    priority_date = parse_priority_date(soup)
+
+    return {
+        "patent_no": patent_no_clean,
+        "title": title,
+        "inventor": inventor,
+        "assignee": assignee,
+        "status": status_val,
+        "priority_date": priority_date,
+        "exp_date": exp_date,
+    }
+
+# -------------------------------
+# Streamlit UI
+# -------------------------------
+
+st.title("Patent Metadata Extractor")
+
+st.write("Paste your patent numbers (one per line):")
+
+input_text = st.text_area("Patent Numbers")
+
+all_fields = [
     "patent_no",
     "title",
     "inventor",
@@ -18,151 +138,30 @@ FIELDS = [
     "exp_date",
 ]
 
-class GooglePatentsClient:
-    def __init__(self, timeout=30):
-        self.timeout = timeout
-        self.headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept-Encoding": "gzip, deflate",
-            "Accept": "*/*",
-            "Connection": "keep-alive",
-        }
+st.write("Select fields to return:")
 
-    def url_from_patno(self, no: str) -> str:
-        return f"https://patents.google.com/patent/{no}/en?oq={no}"
-
-    def get_html(self, url: str):
-        try:
-            resp = requests.get(url, headers=self.headers, timeout=self.timeout)
-            return resp, resp.status_code
-        except Exception as e:
-            return None, 0
-
-    def parse(self, response):
-        soup = BeautifulSoup(response.text, "html.parser")
-
-        # From <title>
-        title_tag = soup.find("title")
-        patent_no, title = "", ""
-        if title_tag and title_tag.text:
-            parts = re.split(r" - |\n", title_tag.text)
-            if len(parts) >= 2:
-                patent_no = parts[0].strip()
-                title = parts[1].strip()
-
-        # Inventor
-        inventor_tag = soup.find("dd", itemprop="inventor")
-        inventor = inventor_tag.text.strip() if inventor_tag else None
-
-        # Assignee
-        assignee_tag = soup.find("span", itemprop="assigneeSearch")
-        assignee = assignee_tag.text.strip() if assignee_tag else None
-        if assignee == inventor:
-            assignee = None
-
-        # Priority Date
-        pr_tag = soup.find(attrs={"itemprop": "priorityDate"})
-        priority_date = pr_tag.text.strip() if pr_tag else "DATE MISSING"
-
-        # Status + Expiration
-        status_tag = soup.find("span", itemprop="status")
-        exp_tag = soup.find("time", itemprop="expiration")
-
-        status_val = status_tag.text.strip() if status_tag else None
-        exp_date = exp_tag.text.strip() if exp_tag else "DATE MISSING"
-
-        if status_val:
-            if "Expired" in status_val:
-                status = "Expired"
-            elif status_val == "Active" and exp_tag:
-                status = f"Active (Exp. {exp_date})"
-            else:
-                status = status_val
-        else:
-            status = "No status or exp date"
-
-        return {
-            "patent_no": patent_no,
-            "title": title,
-            "inventor": inventor or "None",
-            "assignee": assignee or "None",
-            "status": status,
-            "priority_date": priority_date,
-            "exp_date": exp_date,
-        }
-
-# ------------------------------
-# Streamlit UI
-# ------------------------------
-
-st.title("Google Patents Fetcher")
-
-st.write("Paste patent/publication numbers, select fields, and fetch structured data.")
-
-raw_patents = st.text_area(
-    "Paste patent numbers (any whitespace or commas):",
-    height=200,
-    placeholder="US10772732\nUS11026798\nUS11484413\n..."
-)
-
-# Normalize input
-patent_list = sorted(
-    set(re.split(r"[\s,]+", raw_patents.strip())) - {""}
-)
-
-st.write(f"**Detected {len(patent_list)} unique patent numbers.**")
-
-# Field selection (checkbox UI)
-st.subheader("Select which fields to return:")
 selected_fields = []
-cols = st.columns(3)
+for field in all_fields:
+    if st.checkbox(field, value=(field in ["patent_no", "status", "exp_date"])):
+        selected_fields.append(field)
 
-for i, field in enumerate(FIELDS):
-    with cols[i % 3]:
-        if st.checkbox(field, value=(field in ["patent_no", "status"])):
-            selected_fields.append(field)
+if st.button("Fetch Metadata"):
+    if not input_text.strip():
+        st.error("Please paste at least one patent number.")
+    else:
+        pat_list = [p.strip() for p in input_text.split("\n") if p.strip()]
 
-include_url = st.checkbox("Include Google Patents URL", value=False)
+        results = []
 
-fetch = st.button("Fetch")
+        for pat in pat_list:
+            html, code, url = fetch_html(pat)
+            if code != 200:
+                results.append({field: f"ERROR ({code})" for field in selected_fields})
+                continue
+            data = parse_patent(pat, html)
+            # maintain order; only take selected fields
+            results.append({field: data[field] for field in selected_fields})
 
-client = GooglePatentsClient()
-
-# ------------------------------
-# Fetch & Display Results
-# ------------------------------
-if fetch:
-    rows = []
-    for pat in patent_list:
-        url = client.url_from_patno(pat)
-        response, code = client.get_html(url)
-
-        if code != 200:
-            rows.append({"patent_no": pat, "error": f"HTTP {code}"})
-            continue
-
-        data = client.parse(response)
-        row = {f: data[f] for f in selected_fields}
-        if include_url:
-            row["url"] = url
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-
-    st.subheader("Results")
-    st.dataframe(df, use_container_width=True)
-
-    # Downloads
-    st.download_button(
-        "Download CSV",
-        df.to_csv(index=False),
-        file_name="patents.csv",
-        mime="text/csv"
-    )
-
-    st.download_button(
-        "Download TSV",
-        df.to_csv(index=False, sep="\t"),
-        file_name="patents.tsv",
-        mime="text/tab-separated-values"
-    )
+        st.success("Done!")
+        st.write("Results:")
+        st.dataframe(results)
